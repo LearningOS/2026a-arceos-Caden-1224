@@ -133,13 +133,79 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
+        // Resolve both paths against the same mounted filesystem. The destination
+        // path must be translated into that filesystem's own namespace too.
+        let (src_fs, src_rest) = self.resolve_mount(src_path);
+        let (dst_fs, dst_rest) = self.resolve_mount(dst_path);
+        if !Arc::ptr_eq(&src_fs, &dst_fs) {
+            return ax_err!(InvalidInput, "cross-filesystem rename");
+        }
+        if src_rest.is_empty() || dst_rest.is_empty() {
+            return ax_err!(PermissionDenied); // cannot rename mount points
+        }
+
+        match src_fs.root_dir().rename(&src_rest, &dst_rest) {
+            Ok(()) => Ok(()),
+            // Ramfs does not implement rename. Fall back to copying the file
+            // contents to the destination and removing the source.
+            Err(AxError::Unsupported) => Self::rename_file_by_copy(src_fs.as_ref(), &src_rest, &dst_rest),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl RootDirectory {
+    /// Splits a path into the mounted filesystem that contains it and the
+    /// path relative to that filesystem's root directory.
+    fn resolve_mount(&self, path: &str) -> (Arc<dyn VfsOps>, String) {
+        let path = path.trim_matches('/');
+        let path = path.strip_prefix("./").unwrap_or(path);
+
+        let mut idx = 0;
+        let mut max_len = 0;
+        for (i, mp) in self.mounts.iter().enumerate() {
+            // skip the first '/'
+            if path.starts_with(&mp.path[1..]) && mp.path.len() - 1 > max_len {
+                max_len = mp.path.len() - 1;
+                idx = i;
             }
-        })
+        }
+
+        if max_len == 0 {
+            (self.main_fs.clone(), path.into())
+        } else {
+            (
+                self.mounts[idx].fs.clone(),
+                path[max_len..].trim_start_matches('/').into(),
+            )
+        }
+    }
+
+    fn rename_file_by_copy(fs: &dyn VfsOps, src: &str, dst: &str) -> VfsResult {
+        let root = fs.root_dir();
+        let src_node = root.clone().lookup(src)?;
+        let attr = src_node.get_attr()?;
+        if attr.is_dir() {
+            return ax_err!(Unsupported);
+        }
+
+        let mut data = Vec::new();
+        let mut offset = 0u64;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = src_node.read_at(offset, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+
+        root.create(dst, VfsNodeType::File)?;
+        let dst_node = root.clone().lookup(dst)?;
+        dst_node.write_at(0, &data)?;
+        root.remove(src)?;
+        Ok(())
     }
 }
 

@@ -7,6 +7,7 @@ use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
+use axhal::mem::{MemoryAddr, PAGE_SIZE_4K};
 use arceos_posix_api as api;
 
 const SYS_IOCTL: usize = 29;
@@ -140,7 +141,33 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let mmap_flags = MmapFlags::from_bits(flags).unwrap();
+    let mmap_prot = MmapProt::from_bits(prot).unwrap();
+    let mapping_flags: MappingFlags = mmap_prot.into();
+
+    let curr = axtask::current();
+    let mut aspace = curr.task_ext().aspace.lock();
+    let map_len = ((length + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K) * PAGE_SIZE_4K;
+
+    let hint = aspace.base();
+    let va_range = memory_addr::VirtAddrRange::new(aspace.base(), aspace.end());
+    let aligned_vaddr = aspace.find_free_area(hint, map_len, va_range).unwrap();
+
+    aspace
+        .map_alloc(aligned_vaddr, map_len, mapping_flags, true)
+        .unwrap();
+
+    if fd >= 0 && !mmap_flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        let mut buf = alloc::vec![0u8; length];
+        let read_len = api::sys_read(fd, buf.as_mut_ptr() as *mut core::ffi::c_void, length);
+        if read_len > 0 {
+            aspace
+                .write(aligned_vaddr, &buf[..read_len as usize])
+                .unwrap();
+        }
+    }
+
+    usize::from(aligned_vaddr) as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
